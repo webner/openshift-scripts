@@ -1,0 +1,76 @@
+#!/bin/bash
+set -eo pipefail
+
+filtered_properties=(
+  .status
+  .metadata.resourceVersion
+  .metadata.managedFields
+  .metadata.creationTimestamp
+  .metadata.generation
+  .metadata.selfLink
+  .metadata.uid
+  .spec.clusterIP
+  .spec.clusterIPs
+  '.metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"]'
+  '.spec.triggers[]?.imageChange.lastTriggeredImageID'
+)
+
+OC_ARGUMENTS=()
+while [[ $# -gt 0 ]]
+do
+key="$1"
+
+case $key in
+    --strip-namespace)
+    filtered_properties+=(.metadata.namespace)
+    shift
+    ;;
+    *)    # unknown option
+    OC_ARGUMENTS+=("$1") # save it in an array for later
+    shift # past argument
+    ;;
+esac
+done
+set -- "${OC_ARGUMENTS[@]}" # restore oc parameters
+
+function join_by { local IFS="$1"; shift; echo "$*"; }
+
+function json2yaml {
+  python -c "
+import sys, yaml, json; 
+print(yaml.safe_dump(json.loads(sys.stdin.read()), default_flow_style=False));
+"
+}
+
+function write {
+  local JSON="$1"
+
+  local kind=$(echo "$JSON" | jq -r '.kind')
+  local name=$(echo "$JSON" | jq -r '.metadata.name')
+  local hasOwner=$(echo "$JSON" | jq -r 'select(.metadata.ownerReferences) | "true"')
+
+  if [ ! "$hasOwner" == "" ] ; then
+    echo "Skipping $kind/$name with ownerReference"
+    return
+  fi
+
+  target=$(echo "${name}-${kind}.yaml" | tr '[:upper:]' '[:lower:]')
+
+  filtered=$(echo "$JSON" |  jq "del($(join_by , ${filtered_properties[@]}))")
+
+  echo "Exporting $kind/$name to $target"
+  echo "$filtered" | json2yaml > "$target"
+}
+
+JSON=$(oc get $@ -o json)
+
+kind=$(echo "$JSON" | jq -r '.kind')
+
+if [[ "$kind" == "List" ]]; then
+  while read -r item
+  do
+    write "$item"
+  done < <(echo "$JSON" | jq -cr '.items[]')
+else
+  write "$JSON"
+fi
